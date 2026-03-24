@@ -86,7 +86,7 @@ app.post('/start', async (req, res) => {
   if (!validRegions.includes(region)) return res.status(400).json({ success: false, error: 'Region tidak valid' });
 
   try {
-    const aki = new Aki({ region, childMode, httpsAgent });
+    const aki = new Aki({ region, childMode });
     await aki.start();
 
     const sessionData = {
@@ -130,7 +130,7 @@ app.post('/step', async (req, res) => {
   await saveSession(sessionId, session);
 
   try {
-    const aki = new Aki({ region: session.region, childMode: session.childMode, httpsAgent });
+    const aki = new Aki({ region: session.region, childMode: session.childMode });
     aki.session = session.session;
     aki.signature = session.signature;
     aki.currentStep = session.step;
@@ -167,7 +167,7 @@ app.post('/win', async (req, res) => {
   if (!session) return res.status(400).json({ success: false, error: 'Session tidak ditemukan' });
 
   try {
-    const aki = new Aki({ region: session.region, childMode: session.childMode, httpsAgent });
+    const aki = new Aki({ region: session.region, childMode: session.childMode });
     aki.session = session.session;
     aki.signature = session.signature;
     aki.currentStep = session.step;
@@ -197,7 +197,7 @@ app.post('/back', async (req, res) => {
   if (session.questionCount <= 1) return res.status(400).json({ success: false, error: 'Sudah di awal' });
 
   try {
-    const aki = new Aki({ region: session.region, childMode: session.childMode, httpsAgent });
+    const aki = new Aki({ region: session.region, childMode: session.childMode });
     aki.session = session.session;
     aki.signature = session.signature;
     aki.currentStep = session.step;
