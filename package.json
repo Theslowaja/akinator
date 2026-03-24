@@ -1,0 +1,16 @@
+{
+  "name": "akinator-roblox-server",
+  "version": "1.0.0",
+  "description": "Middleware Akinator untuk Roblox menggunakan aki-api",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "aki-api": "latest",
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
