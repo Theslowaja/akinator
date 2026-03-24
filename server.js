@@ -1,44 +1,81 @@
 // ============================================================
-// Akinator Middleware Server (menggunakan library aki-api)
-// https://github.com/jgoralcz/aki-api
-// Deploy gratis ke: Railway / Render / Koyeb
+// PRODUCTION Akinator Server (Redis + Anti Exploit + Scalable)
 // ============================================================
+
+require('dotenv').config();
 
 const express = require('express');
 const { Aki } = require('aki-api');
+const Redis = require('ioredis');
+const { RateLimiterMemory } = require('rate-limiter-flexible');
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Simpan sesi aktif (in-memory)
-// Key: sessionId (misal "player_12345")
-// Value: instance Aki
-const sessions = {};
+// ── Redis Setup ─────────────────────────────────────────────
+const redis = new Redis(process.env.REDIS_URL);
 
-// Bersihkan sesi yang sudah lebih dari 30 menit (anti memory leak)
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, data] of Object.entries(sessions)) {
-    if (now - data.createdAt > 30 * 60 * 1000) {
-      delete sessions[id];
-    }
+// ── Rate Limiter (anti spam) ────────────────────────────────
+const rateLimiter = new RateLimiterMemory({
+  points: 10,       // max 10 request
+  duration: 5,      // per 5 detik
+});
+
+// ── Middleware: API KEY ─────────────────────────────────────
+app.use((req, res, next) => {
+  const key = req.headers['x-api-key'];
+  if (key !== process.env.API_KEY) {
+    return res.status(403).json({ success: false, error: 'Unauthorized' });
   }
-}, 5 * 60 * 1000); // cek setiap 5 menit
+  next();
+});
 
-// ── Health check ────────────────────────────────────────────
-app.get('/', (req, res) => {
+// ── Middleware: Rate Limit ──────────────────────────────────
+app.use(async (req, res, next) => {
+  try {
+    await rateLimiter.consume(req.ip);
+    next();
+  } catch {
+    return res.status(429).json({
+      success: false,
+      error: 'Terlalu banyak request',
+    });
+  }
+});
+
+// ── Helper: Save session ────────────────────────────────────
+async function saveSession(sessionId, data) {
+  await redis.set(
+    `aki:${sessionId}`,
+    JSON.stringify(data),
+    'EX',
+    60 * 30 // 30 menit
+  );
+}
+
+// ── Helper: Load session ────────────────────────────────────
+async function loadSession(sessionId) {
+  const data = await redis.get(`aki:${sessionId}`);
+  return data ? JSON.parse(data) : null;
+}
+
+// ── Helper: Delete session ──────────────────────────────────
+async function deleteSession(sessionId) {
+  await redis.del(`aki:${sessionId}`);
+}
+
+// ── Health Check ────────────────────────────────────────────
+app.get('/', async (req, res) => {
+  const keys = await redis.keys('aki:*');
   res.json({
     status: 'ok',
-    message: 'Akinator Roblox API aktif!',
-    activeSessions: Object.keys(sessions).length,
+    activeSessions: keys.length,
   });
 });
 
-// ── POST /start ──────────────────────────────────────────────
-// Mulai game Akinator baru
-// Body: { sessionId: "player_123", region: "en", childMode: false }
+// ── START ───────────────────────────────────────────────────
 app.post('/start', async (req, res) => {
   const { sessionId, region = 'en', childMode = false } = req.body;
 
@@ -46,163 +83,192 @@ app.post('/start', async (req, res) => {
     return res.status(400).json({ success: false, error: 'sessionId diperlukan' });
   }
 
-  // Hapus sesi lama jika ada
-  if (sessions[sessionId]) {
-    delete sessions[sessionId];
+  const validRegions = ['en', 'id', 'fr', 'es', 'jp'];
+  if (!validRegions.includes(region)) {
+    return res.status(400).json({ success: false, error: 'Region tidak valid' });
   }
 
   try {
     const aki = new Aki({ region, childMode });
     await aki.start();
 
-    sessions[sessionId] = {
-      aki,
-      createdAt: Date.now(),
+    const sessionData = {
+      region,
+      childMode,
+      step: aki.currentStep,
+      progress: aki.progress,
+      question: aki.question,
+      answers: aki.answers,
+      signature: aki.signature,
+      session: aki.session,
       questionCount: 1,
+      locked: false,
     };
 
-    return res.json({
+    await saveSession(sessionId, sessionData);
+
+    res.json({
       success: true,
       question: aki.question,
-      answers: aki.answers,       // ["Yes","No","Don't know","Probably","Probably not"]
+      answers: aki.answers,
+      progress: aki.progress,
       questionNumber: 1,
-      progress: aki.progress ?? 0,
     });
+
   } catch (err) {
-    console.error('[/start] Error:', err.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Gagal memulai Akinator. Coba lagi.',
-      detail: err.message,
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── POST /step ───────────────────────────────────────────────
-// Kirim jawaban (step)
-// Body: { sessionId: "player_123", answer: 0 }
-// answer: 0=Yes, 1=No, 2=Don't know, 3=Probably, 4=Probably not
+// ── STEP ────────────────────────────────────────────────────
 app.post('/step', async (req, res) => {
   const { sessionId, answer } = req.body;
 
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(400).json({ success: false, error: 'Sesi tidak ditemukan. Panggil /start terlebih dahulu.' });
+  if (typeof answer !== 'number' || answer < 0 || answer > 4) {
+    return res.status(400).json({ success: false, error: 'Jawaban harus 0-4' });
   }
 
-  if (answer === undefined || answer === null) {
-    return res.status(400).json({ success: false, error: 'Jawaban diperlukan (0-4)' });
+  const session = await loadSession(sessionId);
+  if (!session) {
+    return res.status(400).json({ success: false, error: 'Session tidak ditemukan' });
   }
 
-  const session = sessions[sessionId];
-  const aki = session.aki;
+  if (session.locked) {
+    return res.status(429).json({ success: false, error: 'Request masih diproses' });
+  }
+
+  session.locked = true;
+  await saveSession(sessionId, session);
 
   try {
+    const aki = new Aki({
+      region: session.region,
+      childMode: session.childMode,
+    });
+
+    // restore state
+    aki.session = session.session;
+    aki.signature = session.signature;
+    aki.currentStep = session.step;
+
     await aki.step(answer);
+
+    session.step = aki.currentStep;
+    session.progress = aki.progress;
+    session.question = aki.question;
+    session.answers = aki.answers;
     session.questionCount++;
 
-    // Jika progress tinggi (>= 80), Akinator siap menebak
-    const shouldGuess = aki.progress >= 80 || session.questionCount >= 20;
+    session.locked = false;
+    await saveSession(sessionId, session);
 
-    return res.json({
+    res.json({
       success: true,
       question: aki.question,
       answers: aki.answers,
+      progress: aki.progress,
       questionNumber: session.questionCount,
-      progress: aki.progress ?? 0,
-      shouldGuess,  // hint ke client bahwa sudah siap tebak
+      shouldGuess: aki.progress >= 80,
     });
+
   } catch (err) {
-    console.error('[/step] Error:', err.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Gagal memproses jawaban.',
-      detail: err.message,
-    });
+    session.locked = false;
+    await saveSession(sessionId, session);
+
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── POST /win ────────────────────────────────────────────────
-// Minta Akinator menebak karakter
-// Body: { sessionId: "player_123" }
+// ── WIN ─────────────────────────────────────────────────────
 app.post('/win', async (req, res) => {
   const { sessionId } = req.body;
 
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(400).json({ success: false, error: 'Sesi tidak ditemukan.' });
+  const session = await loadSession(sessionId);
+  if (!session) {
+    return res.status(400).json({ success: false, error: 'Session tidak ditemukan' });
   }
 
-  const session = sessions[sessionId];
-  const aki = session.aki;
-
   try {
+    const aki = new Aki({
+      region: session.region,
+      childMode: session.childMode,
+    });
+
+    aki.session = session.session;
+    aki.signature = session.signature;
+    aki.currentStep = session.step;
+
     await aki.win();
 
-    const guess = aki.answers[0]; // tebakan terbaik ada di index 0
+    const guesses = aki.answers || [];
 
-    return res.json({
+    await deleteSession(sessionId);
+
+    res.json({
       success: true,
-      type: 'guess',
-      character: guess?.name ?? 'Tidak diketahui',
-      description: guess?.description ?? '',
-      ranking: guess?.ranking ?? 0,
-      photo: guess?.absolute_picture_path ?? null,
-      allGuesses: aki.answers.slice(0, 3), // top 3 tebakan
+      character: guesses[0]?.name,
+      description: guesses[0]?.description,
+      photo: guesses[0]?.absolute_picture_path,
+      guesses: guesses.slice(0, 3),
     });
+
   } catch (err) {
-    console.error('[/win] Error:', err.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Gagal mengambil tebakan.',
-      detail: err.message,
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── POST /back ───────────────────────────────────────────────
-// Kembali ke pertanyaan sebelumnya
-// Body: { sessionId: "player_123" }
+// ── BACK ────────────────────────────────────────────────────
 app.post('/back', async (req, res) => {
   const { sessionId } = req.body;
 
-  if (!sessionId || !sessions[sessionId]) {
-    return res.status(400).json({ success: false, error: 'Sesi tidak ditemukan.' });
+  const session = await loadSession(sessionId);
+  if (!session) {
+    return res.status(400).json({ success: false, error: 'Session tidak ditemukan' });
   }
 
-  const session = sessions[sessionId];
-  const aki = session.aki;
+  if (session.questionCount <= 1) {
+    return res.status(400).json({ success: false, error: 'Sudah di awal' });
+  }
 
   try {
-    await aki.back();
-    session.questionCount = Math.max(1, session.questionCount - 1);
+    const aki = new Aki({
+      region: session.region,
+      childMode: session.childMode,
+    });
 
-    return res.json({
+    aki.session = session.session;
+    aki.signature = session.signature;
+    aki.currentStep = session.step;
+
+    await aki.back();
+
+    session.step = aki.currentStep;
+    session.progress = aki.progress;
+    session.question = aki.question;
+    session.answers = aki.answers;
+    session.questionCount--;
+
+    await saveSession(sessionId, session);
+
+    res.json({
       success: true,
       question: aki.question,
       answers: aki.answers,
+      progress: aki.progress,
       questionNumber: session.questionCount,
-      progress: aki.progress ?? 0,
     });
+
   } catch (err) {
-    console.error('[/back] Error:', err.message);
-    return res.status(500).json({
-      success: false,
-      error: 'Gagal kembali ke pertanyaan sebelumnya.',
-      detail: err.message,
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── DELETE /session/:sessionId ───────────────────────────────
-// Hapus sesi saat player selesai
-app.delete('/session/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  if (sessions[sessionId]) {
-    delete sessions[sessionId];
-    return res.json({ success: true, message: 'Sesi dihapus.' });
-  }
-  return res.status(404).json({ success: false, error: 'Sesi tidak ditemukan.' });
+// ── DELETE SESSION ──────────────────────────────────────────
+app.delete('/session/:sessionId', async (req, res) => {
+  await deleteSession(req.params.sessionId);
+  res.json({ success: true });
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Akinator Roblox Server berjalan di port ${PORT}`);
+  console.log(`🔥 Production Akinator running on ${PORT}`);
 });
