@@ -11,6 +11,18 @@ const { RateLimiterMemory } = require('rate-limiter-flexible');
 const https = require('https');
 const fs = require('fs');
 
+// ── TLS / SSL Configuration ─────────────────────────────────
+// NODE_TLS_REJECT_UNAUTHORIZED=0 disables SSL certificate verification.
+// Use ONLY in development or when the host CA bundle is unavailable.
+// Never set this to '0' in production — it exposes the app to MITM attacks.
+if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+  console.warn(
+    '[WARN] NODE_TLS_REJECT_UNAUTHORIZED=0 — SSL certificate verification is DISABLED. ' +
+    'Do not use this setting in production.'
+  );
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+}
+
 const app = express();
 app.use(express.json());
 
@@ -60,12 +72,85 @@ async function deleteSession(sessionId) {
   await redis.del(`aki:${sessionId}`);
 }
 
-// ── HTTPS Agent (opsional, aman untuk TLS) ──────────────────
+// ── HTTPS Agent ─────────────────────────────────────────────
+// aki-api does not expose an option to inject a custom HTTPS agent, so TLS
+// behaviour is controlled globally via NODE_TLS_REJECT_UNAUTHORIZED (above)
+// or by supplying a trusted CA bundle through CA_BUNDLE_PATH.
+// The agent below is constructed for reference / future use if the library
+// ever exposes an agent option.
 let httpsAgent;
 if (process.env.CA_BUNDLE_PATH) {
   httpsAgent = new https.Agent({
     ca: fs.readFileSync(process.env.CA_BUNDLE_PATH),
   });
+} else if (process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0') {
+  httpsAgent = new https.Agent({ rejectUnauthorized: false });
+}
+
+// ── Helper: SSL-aware error handler ────────────────────────
+// Detects certificate errors thrown by Node.js TLS and surfaces a clear
+// message with remediation guidance instead of a raw OpenSSL code.
+const SSL_ERROR_CODES = new Set([
+  'UNABLE_TO_GET_ISSUER_CERT',
+  'UNABLE_TO_GET_CRL',
+  'UNABLE_TO_DECRYPT_CERT_SIGNATURE',
+  'UNABLE_TO_DECRYPT_CRL_SIGNATURE',
+  'UNABLE_TO_DECODE_ISSUER_PUBLIC_KEY',
+  'CERT_SIGNATURE_FAILURE',
+  'CRL_SIGNATURE_FAILURE',
+  'CERT_NOT_YET_VALID',
+  'CERT_HAS_EXPIRED',
+  'CRL_NOT_YET_VALID',
+  'CRL_HAS_EXPIRED',
+  'ERROR_IN_CERT_NOT_BEFORE_FIELD',
+  'ERROR_IN_CERT_NOT_AFTER_FIELD',
+  'ERROR_IN_CRL_LAST_UPDATE_FIELD',
+  'ERROR_IN_CRL_NEXT_UPDATE_FIELD',
+  'OUT_OF_MEM',
+  'DEPTH_ZERO_SELF_SIGNED_CERT',
+  'SELF_SIGNED_CERT_IN_CHAIN',
+  'UNABLE_TO_GET_ISSUER_CERT_LOCALLY',
+  'UNABLE_TO_VERIFY_LEAF_SIGNATURE',
+  'CERT_CHAIN_TOO_LONG',
+  'CERT_REVOKED',
+  'INVALID_CA',
+  'PATH_LENGTH_EXCEEDED',
+  'INVALID_PURPOSE',
+  'CERT_UNTRUSTED',
+  'CERT_REJECTED',
+  'HOSTNAME_MISMATCH',
+]);
+
+function isSslError(err) {
+  if (!err) return false;
+  const code = err.code || '';
+  if (SSL_ERROR_CODES.has(code)) return true;
+  const msg = (err.message || '').toLowerCase();
+  return (
+    msg.includes('unable to get local issuer certificate') ||
+    msg.includes('certificate') ||
+    msg.includes('ssl') ||
+    msg.includes('tls')
+  );
+}
+
+function handleRouteError(err, res, context) {
+  const ssl = isSslError(err);
+  if (ssl) {
+    console.error(
+      `[SSL ERROR] ${context}: ${err.message} (code: ${err.code || 'n/a'}). ` +
+      'To bypass in development set NODE_TLS_REJECT_UNAUTHORIZED=0. ' +
+      'In production, ensure the host has up-to-date CA certificates.'
+    );
+    return res.status(502).json({
+      success: false,
+      error: 'SSL certificate error when contacting Akinator API.',
+      hint: 'Set NODE_TLS_REJECT_UNAUTHORIZED=0 for development, or ensure valid CA certificates are installed on the server.',
+      code: err.code || 'SSL_ERROR',
+    });
+  }
+  console.error(`[ERROR] ${context}: ${err.message}`);
+  return res.status(500).json({ success: false, error: err.message });
 }
 
 // ── Health Check ────────────────────────────────────────────
@@ -112,7 +197,7 @@ app.post('/start', async (req, res) => {
       questionNumber: 1,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleRouteError(err, res, 'POST /start');
   }
 });
 
@@ -156,7 +241,7 @@ app.post('/step', async (req, res) => {
   } catch (err) {
     session.locked = false;
     await saveSession(sessionId, session);
-    res.status(500).json({ success: false, error: err.message });
+    handleRouteError(err, res, 'POST /step');
   }
 });
 
@@ -185,7 +270,7 @@ app.post('/win', async (req, res) => {
       guesses: guesses.slice(0, 3),
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleRouteError(err, res, 'POST /win');
   }
 });
 
@@ -220,7 +305,7 @@ app.post('/back', async (req, res) => {
       questionNumber: session.questionCount,
     });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    handleRouteError(err, res, 'POST /back');
   }
 });
 
